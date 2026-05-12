@@ -75,6 +75,7 @@ export default function App() {
       .catch(() => setServerStatus('offline'));
   }, []);
 
+  const [isDragging, setIsDragging] = useState(false);
   const [data, setData] = useState<CallRecord[]>([]);
   const [filters, setFilters] = useState<DashboardFilters>({
     dateRange: [null, null],
@@ -83,50 +84,109 @@ export default function App() {
     type: 'Todos'
   });
   const [searchQuery, setSearchQuery] = useState('');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const triggerFileUpload = () => {
+    setErrorMsg(null);
     fileInputRef.current?.click();
   };
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
+  const processFile = (file: File) => {
+    setErrorMsg(null);
     Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
-      delimiter: ";", // Suporte ao formato de ponto e vírgula do sample
       complete: (results) => {
+        if (!results.data || results.data.length === 0) {
+          setErrorMsg("O arquivo parece estar vazio ou em formato inválido.");
+          return;
+        }
+
         const parsedData: CallRecord[] = results.data
-          .filter((row: any) => row['Data']) // Garante linha válida
+          .filter((row: any) => row['Data'] || row['Date'] || row['timestamp']) 
           .map((row: any, index) => {
-            const timestampStr = row['Data'] || '';
+            const timestampStr = row['Data'] || row['Date'] || row['timestamp'] || '';
             let timestamp = new Date();
-            try {
-              timestamp = parse(timestampStr, 'yyyy-MM-dd HH:mm:ss', new Date(), { locale: ptBR });
-              if (isNaN(timestamp.getTime())) {
-                timestamp = new Date(timestampStr);
-              }
-            } catch (e) {
+            
+            // Tentativa de parsing flexível
+            const formats = [
+              'yyyy-MM-dd HH:mm:ss',
+              'dd/MM/yyyy HH:mm:ss',
+              'dd/MM/yyyy HH:mm',
+              'MM/dd/yyyy HH:mm:ss',
+              'yyyy-MM-dd'
+            ];
+
+            for (const fmt of formats) {
+              try {
+                const p = parse(timestampStr, fmt, new Date(), { locale: ptBR });
+                if (!isNaN(p.getTime())) {
+                  timestamp = p;
+                  break;
+                }
+              } catch (e) {}
+            }
+
+            // Fallback para Date nativo se falhar
+            if (isNaN(timestamp.getTime())) {
+              timestamp = new Date(timestampStr);
+            }
+            
+            if (isNaN(timestamp.getTime())) {
               timestamp = new Date();
             }
 
-            const extension = row['Origem'] || 'N/A';
-            const agent = row['Fila'] ? `${row['Fila']} (${extension})` : `Ramal ${extension}`;
+            const extension = row['Origem'] || row['Source'] || row['Extension'] || 'N/A';
+            const fila = row['Fila'] || row['Queue'] || '';
+            const agent = fila ? `${fila} (${extension})` : `Ramal ${extension}`;
+            
+            const durationRaw = row['Duracao'] || row['Duração'] || row['Duration'] || '0';
             
             return {
               id: index.toString(),
               timestamp,
               extension,
               agent,
-              duration: parseInt(row['Duracao'] || row['Duração']) || 0,
-              status: row['Status'] === 'Atendida' ? 'Atendida' : 'Perdida',
-              type: row['Tipo'] === 'Entrante' ? 'Destino' : 'Origem'
+              duration: parseInt(durationRaw) || 0,
+              status: (row['Status'] || '').toLowerCase().includes('atend') ? 'Atendida' : 'Perdida',
+              type: (row['Tipo'] || row['Type'] || '').toLowerCase().includes('entr') ? 'Destino' : 'Origem'
             };
           });
-        setData(parsedData);
+
+        if (parsedData.length > 0) {
+          setData(parsedData);
+        }
+      },
+      error: (error) => {
+        console.error("Erro ao processar CSV:", error);
       }
     });
+  };
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    processFile(file);
+    // Limpar o valor para permitir re-upload do mesmo arquivo
+    if (event.target) event.target.value = '';
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type === "text/csv" || file.name.endsWith('.csv')) {
+      processFile(file);
+    }
   };
 
   const dashboardData = useMemo(() => {
@@ -261,7 +321,40 @@ export default function App() {
         )}
       </header>
 
-      <main className="flex-1 p-6 max-w-[1600px] mx-auto w-full">
+      <main 
+        className={cn(
+          "flex-1 p-6 max-w-[1600px] mx-auto w-full transition-all duration-300",
+          isDragging && "bg-emerald-50 scale-[0.99] rounded-3xl"
+        )}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
+        {isDragging && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-emerald-900/20 backdrop-blur-sm pointer-events-none">
+            <div className="bg-white p-8 rounded-3xl shadow-2xl border-4 border-dashed border-emerald-500 flex flex-col items-center gap-4 animate-in zoom-in duration-300">
+              <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center">
+                <Upload className="w-8 h-8 text-emerald-600 animate-bounce" />
+              </div>
+              <p className="text-xl font-bold text-emerald-900">Solte para importar o CSV</p>
+            </div>
+          </div>
+        )}
+        {errorMsg && (
+          <motion.div 
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-6 p-4 bg-red-50 border border-red-100 text-red-700 rounded-xl flex items-center justify-between"
+          >
+            <div className="flex items-center gap-3">
+              <XCircle className="w-5 h-5" />
+              <p className="text-sm font-medium">{errorMsg}</p>
+            </div>
+            <button onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-600 transition-colors">
+              <XCircle className="w-4 h-4" />
+            </button>
+          </motion.div>
+        )}
         {data.length === 0 ? (
           <EmptyState onUpload={triggerFileUpload} />
         ) : (
