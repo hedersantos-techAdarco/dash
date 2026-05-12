@@ -122,6 +122,34 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   return null;
 };
 
+interface FilterSelectProps {
+  label: string;
+  value: string;
+  onChange: (val: string) => void;
+  options: { label: string; value: string }[];
+  icon?: React.ElementType;
+}
+
+const FilterSelect = ({ label, value, onChange, options, icon: Icon }: FilterSelectProps) => (
+  <div className="space-y-2">
+    <p className="text-xs font-bold text-white/70 pl-1 flex items-center gap-2">
+      {Icon && <Icon className="w-3.5 h-3.5" />} {label}
+    </p>
+    <div className="relative">
+      <select 
+        className="w-full bg-white/10 border border-white/20 rounded-xl py-3 pl-4 pr-10 text-sm font-bold appearance-none focus:ring-2 focus:ring-white/20 focus:bg-[#004D2C] outline-none transition-all cursor-pointer text-white backdrop-blur-xl"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {options.map(opt => (
+          <option key={opt.value} className="bg-[#004D2C]" value={opt.value}>{opt.label}</option>
+        ))}
+      </select>
+      <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/50 pointer-events-none" />
+    </div>
+  </div>
+);
+
 // --- Main App ---
 
 export default function App() {
@@ -140,6 +168,7 @@ export default function App() {
   });
   const [endDate, setEndDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   // Sincroniza automaticamente ao abrir o sistema e a cada 5 minutos
   React.useEffect(() => {
@@ -251,6 +280,7 @@ export default function App() {
       }).filter((d: any) => d.type !== ''); 
 
       setData(processedData);
+      setLastUpdated(new Date());
     } catch (error: any) {
       console.error("Erro na sincronização:", error);
       setErrorMsg(error.message || "Erro ao conectar com a API de telefonia.");
@@ -373,8 +403,17 @@ export default function App() {
     return ['Todos', ...baseList.filter(c => c.team === selectedTeam).map(c => c.name)].sort();
   }, [selectedTeam]);
 
-  const filteredData = useMemo(() => {
+  const dateFilteredData = useMemo(() => {
     return data.filter(item => {
+      const itemDate = (item.timestamp || '').split('T')[0];
+      const matchesStartDate = !startDate || itemDate >= startDate;
+      const matchesEndDate = !endDate || itemDate <= endDate;
+      return matchesStartDate && matchesEndDate;
+    });
+  }, [data, startDate, endDate]);
+
+  const filteredData = useMemo(() => {
+    return dateFilteredData.filter(item => {
       const matchesTeam = selectedTeam === 'Todos' || item.team === selectedTeam;
       const matchesConsultant = selectedConsultant === 'Todos' || item.consultantName === selectedConsultant;
       const matchesType = selectedType === 'Todos' || item.type === selectedType;
@@ -382,13 +421,9 @@ export default function App() {
         item.consultantName?.toLowerCase().includes(searchQuery.toLowerCase()) || 
         item.extension.includes(searchQuery);
       
-      const itemDate = (item.timestamp || '').split('T')[0];
-      const matchesStartDate = !startDate || itemDate >= startDate;
-      const matchesEndDate = !endDate || itemDate <= endDate;
-
-      return matchesTeam && matchesConsultant && matchesType && matchesSearch && matchesStartDate && matchesEndDate;
+      return matchesTeam && matchesConsultant && matchesType && matchesSearch;
     });
-  }, [data, selectedTeam, selectedConsultant, selectedType, searchQuery, startDate, endDate]);
+  }, [dateFilteredData, selectedTeam, selectedConsultant, selectedType, searchQuery]);
 
   const dashboardStats = useMemo(() => {
     const activeCounts: Record<string, { name: string, count: number, team: string }> = {};
@@ -482,14 +517,14 @@ export default function App() {
       [TeamName.DEBORA]: { name: TeamName.DEBORA, total: 0, success: 0 },
       [TeamName.MARILIA]: { name: TeamName.MARILIA, total: 0, success: 0 }
     };
-    data.forEach(d => {
-      if (d.team && statsArr[d.team]) {
-        statsArr[d.team].total++;
-        if (d.status === 'Atendida') statsArr[d.team].success++;
+    dateFilteredData.forEach(d => {
+      if (d.team && statsArr[d.team as keyof typeof statsArr]) {
+        statsArr[d.team as keyof typeof statsArr].total++;
+        if (d.status === 'Atendida') statsArr[d.team as keyof typeof statsArr].success++;
       }
     });
     return Object.values(statsArr);
-  }, [data]);
+  }, [dateFilteredData]);
 
   return (
     <div className="min-h-screen bg-offwhite flex text-graphite font-sans selection:bg-adarco-light selection:text-adarco-dark border-none">
@@ -577,41 +612,27 @@ export default function App() {
             <div className="space-y-6">
               <label className="text-[11px] font-black text-white/50 uppercase tracking-[0.2em] block drop-shadow-sm">Data Filters</label>
               
-              <div className="space-y-2">
-                <p className="text-xs font-bold text-white/70 pl-1">Supervisão</p>
-                <div className="relative">
-                  <select 
-                    className="w-full bg-white/10 border border-white/20 rounded-xl py-3 pl-4 pr-10 text-sm font-bold appearance-none focus:ring-2 focus:ring-white/20 focus:bg-[#004D2C] outline-none transition-all cursor-pointer text-white backdrop-blur-xl"
-                    value={selectedTeam}
-                    onChange={(e) => {
-                      setSelectedTeam(e.target.value);
-                      setSelectedConsultant('Todos');
-                    }}
-                  >
-                    <option className="bg-[#004D2C]" value="Todos">Todos os Times</option>
-                    <option className="bg-[#004D2C]" value={TeamName.DEBORA}>Time Débora</option>
-                    <option className="bg-[#004D2C]" value={TeamName.MARILIA}>Time Marília</option>
-                  </select>
-                  <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/50 pointer-events-none" />
-                </div>
-              </div>
+              <FilterSelect 
+                label="Supervisão"
+                value={selectedTeam}
+                onChange={(val) => {
+                  setSelectedTeam(val);
+                  setSelectedConsultant('Todos');
+                }}
+                options={[
+                  { label: 'Todos os Times', value: 'Todos' },
+                  { label: 'Time Débora', value: TeamName.DEBORA },
+                  { label: 'Time Marília', value: TeamName.MARILIA },
+                ]}
+              />
 
-              <div className="space-y-2">
-                <p className="text-xs font-bold text-white/70 pl-1">Consultor</p>
-                <div className="relative">
-                  <select 
-                    className="w-full bg-white/10 border border-white/20 rounded-xl py-3 pl-4 pr-10 text-sm font-bold appearance-none focus:ring-2 focus:ring-white/20 focus:bg-[#004D2C] outline-none transition-all cursor-pointer text-white backdrop-blur-xl"
-                    value={selectedConsultant}
-                    onChange={(e) => setSelectedConsultant(e.target.value)}
-                  >
-                    <option className="bg-[#004D2C]" value="Todos">Todos os Consultores</option>
-                    {availableConsultants.map(c => (
-                      <option key={c} className="bg-[#004D2C]" value={c}>{c}</option>
-                    ))}
-                  </select>
-                  <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/50 pointer-events-none" />
-                </div>
-              </div>
+              <FilterSelect 
+                label="Consultor"
+                value={selectedConsultant}
+                onChange={setSelectedConsultant}
+                options={availableConsultants.map(c => ({ label: c, value: c }))}
+                icon={Users}
+              />
 
               <div className="space-y-3 pt-6 border-t border-white/20">
                 <p className="text-xs font-bold text-white/80 pl-1 flex items-center gap-2">
@@ -659,6 +680,14 @@ export default function App() {
                 <Calendar className="w-3.5 h-3.5" />
                 {data.length > 0 ? "Dados Ativos" : "Aguardando Importação"}
               </span>
+              {lastUpdated && (
+                <>
+                  <div className="w-1.5 h-1.5 bg-slate-200 rounded-full" />
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tight">
+                    Atualizado às {lastUpdated.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                </>
+              )}
               <div className="w-1.5 h-1.5 bg-adarco-light rounded-full shadow-sm" />
               <span className="text-[10px] font-black text-white bg-adarco-primary px-3 py-1 rounded-lg uppercase tracking-widest shadow-sm">
                 Foco em Resultados
