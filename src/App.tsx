@@ -87,11 +87,17 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const triggerFileUpload = () => {
+    console.log("Triggering file upload click...");
     setErrorMsg(null);
-    fileInputRef.current?.click();
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    } else {
+      console.error("File input ref is null!");
+    }
   };
 
   const processFile = (file: File) => {
+    console.log("Processing file:", file.name, file.size, file.type);
     setErrorMsg(null);
     Papa.parse(file, {
       header: true,
