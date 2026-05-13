@@ -8,8 +8,7 @@ import {
   Phone, PhoneCall, PhoneIncoming, PhoneOutgoing, 
   TrendingUp, Filter, Upload,
   Users, CheckCircle2, XCircle, Search, Calendar,
-  ChevronDown, ArrowUpRight, ArrowDownRight, Menu, X,
-  Loader2
+  ChevronDown, ArrowUpRight, ArrowDownRight, Menu, X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { parse } from 'date-fns';
@@ -81,7 +80,7 @@ const EmptyState = ({ onUpload }: { onUpload: () => void }) => (
     </div>
     <h2 className="text-2xl md:text-3xl font-black text-adarco-dark tracking-tighter mb-2 text-center md:text-left">Dashboard Inside Sales</h2>
     <p className="text-slate-500 max-w-md mb-8 font-medium text-center md:text-left text-sm md:text-base">
-      Sincronize os dados diretamente da telefonia ou carregue um relatório CSV manualmente para analisar a performance da equipe.
+      Carregue o relatório CSV exportado da telefonia para analisar a performance da equipe. Os dados serão salvos localmente.
     </p>
       <button 
         onClick={onUpload}
@@ -145,7 +144,6 @@ export default function App() {
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [data, setData] = useState<CallRecord[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isSyncing, setIsSyncing] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState<string>('Todos');
   const [selectedConsultant, setSelectedConsultant] = useState<string>('Todos');
   const [searchQuery, setSearchQuery] = useState('');
@@ -159,59 +157,22 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  const fetchFromSupabase = async () => {
-    setIsSyncing(true);
-    setErrorMsg(null);
-    try {
-      const params = new URLSearchParams();
-      if (startDate) params.append('startDate', startDate);
-      if (endDate) params.append('endDate', endDate);
-      
-      const response = await fetch(`/api/calls?${params.toString()}`);
-      if (!response.ok) throw new Error("Falha ao buscar dados do banco.");
-      
-      const result = await response.json();
-      if (Array.isArray(result)) {
-        setData(result);
-        setLastUpdated(new Date());
-      }
-    } catch (e: any) {
-      console.error("Fetch error:", e);
-      setErrorMsg(e.message || "Erro ao conectar com o Supabase.");
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  const syncWithAPI = async () => {
-    setIsSyncing(true);
-    setErrorMsg(null);
-    try {
-      const response = await fetch('/api/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ startDate, endDate })
-      });
-      
-      if (!response.ok) throw new Error("Falha na sincronização.");
-      
-      const result = await response.json();
-      console.log("Sync result:", result);
-      
-      // After sync, fetch the updated data
-      await fetchFromSupabase();
-    } catch (e: any) {
-      console.error("Sync error:", e);
-      setErrorMsg(e.message || "Erro ao sincronizar com a telefonia.");
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  // Carrega dados do Supabase ao iniciar e quando o período muda
+  // Carrega dados persistidos do localStorage ao iniciar
   React.useEffect(() => {
-    fetchFromSupabase();
-  }, [startDate, endDate]);
+    const savedData = localStorage.getItem('adarco_persisted_calls');
+    if (savedData) {
+      try {
+        const parsed = JSON.parse(savedData);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setData(parsed);
+          setLastUpdated(new Date());
+          console.log("[App] Dados recuperados do armazenamento local.");
+        }
+      } catch (e) {
+        console.error("[App] Erro ao carregar cache local:", e);
+      }
+    }
+  }, []); 
 
   React.useEffect(() => {
     const handleResize = () => {
@@ -346,21 +307,14 @@ export default function App() {
           setData(parsedData);
           setLastUpdated(new Date());
           
+          // Salva no localStorage para persistência entre sessões
+          localStorage.setItem('adarco_persisted_calls', JSON.stringify(parsedData));
+
           const dates = parsedData.map(d => new Date(d.timestamp).getTime());
           const minDate = new Date(Math.min(...dates)).toISOString().split('T')[0];
           const maxDate = new Date(Math.max(...dates)).toISOString().split('T')[0];
           setStartDate(minDate);
           setEndDate(maxDate);
-
-          // Puxa para o banco de dados Supabase para persistência centralizada
-          fetch('/api/calls', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ calls: parsedData })
-          })
-          .then(res => res.json())
-          .then(res => console.log("CSV persistent sync:", res))
-          .catch(err => console.error("CSV sync error:", err));
         } else {
           setErrorMsg("Nenhum dado de Inside Sales foi encontrado no arquivo.");
         }
@@ -719,18 +673,6 @@ export default function App() {
                 ))}
               </div>
               <div className="flex items-center gap-2 w-full sm:w-auto">
-                <button 
-                    onClick={syncWithAPI}
-                    disabled={isSyncing}
-                    title="Sincronizar com Telefonia"
-                    className={cn(
-                      "flex items-center gap-2 p-3 px-4 bg-emerald-600 text-white rounded-2xl hover:bg-emerald-700 transition-all shadow-soft",
-                      isSyncing && "opacity-70 cursor-not-allowed"
-                    )}
-                >
-                    <Loader2 className={cn("w-5 h-5", isSyncing && "animate-spin")} />
-                    <span className="font-bold text-sm">{isSyncing ? 'Sincronizando...' : 'Sincronizar'}</span>
-                </button>
                 <button 
                     onClick={triggerFileUpload}
                     title="Carregar CSV"
