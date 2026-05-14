@@ -9,12 +9,29 @@ export interface Consultant {
   team: TeamName;
 }
 
+export interface ApiCallData {
+  id: string;
+  externalId: string;
+  createdAt: string;
+  origin: string;
+  destiny: string;
+  disposition: string;
+  duration: number;
+  type: string;
+  calltype: string;
+  originDisplayName: string | null;
+  destinyDisplayName: string | null;
+  sector?: string | null;
+}
+
 export interface CallRecord {
+  id: string;
   extension: string;
   type: string; // "Ativa", "Receptiva" etc
   status: string; // "Atendida", "Não Atendida" etc
   duration: number;
   timestamp: string;
+  displayName?: string;
   consultantName?: string;
   team?: TeamName;
 }

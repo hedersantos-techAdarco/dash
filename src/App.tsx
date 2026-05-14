@@ -1,19 +1,20 @@
-import React, { useState, useMemo } from 'react';
-import Papa from 'papaparse';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import axios from 'axios';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
-  Cell, TooltipProps, PieChart, Pie
+  Cell, PieChart, Pie
 } from 'recharts';
 import { 
-  Phone, PhoneCall, PhoneIncoming, PhoneOutgoing, 
-  TrendingUp, Filter, Upload,
-  Users, CheckCircle2, XCircle, Search, Calendar,
-  ChevronDown, ArrowUpRight, ArrowDownRight, Menu, X
+  Phone, PhoneCall, PhoneOutgoing, 
+  TrendingUp, Users, CheckCircle2, XCircle, Search, Calendar,
+  ChevronDown, ArrowUpRight, ArrowDownRight, Menu, X,
+  RefreshCcw, Loader2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { parse } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
 
+import Papa from 'papaparse';
 import { CallRecord, TeamName } from './types.ts';
 import { CONSULTANT_MAPPING } from './constants.ts';
 import { cn, formatDuration } from './lib/utils.ts';
@@ -73,25 +74,6 @@ const StatCard = ({ title, value, subtext, icon: Icon, trend, colorClass = "prim
   </motion.div>
 );
 
-const EmptyState = ({ onUpload }: { onUpload: () => void }) => (
-  <div className="flex flex-col items-center justify-center min-h-[60vh] text-center px-4">
-    <div className="w-16 h-16 md:w-20 md:h-20 bg-adarco-light/30 rounded-full flex items-center justify-center mb-6">
-      <Users className="w-8 h-8 md:w-10 md:h-10 text-adarco-dark" />
-    </div>
-    <h2 className="text-2xl md:text-3xl font-black text-adarco-dark tracking-tighter mb-2 text-center md:text-left">Dashboard Inside Sales</h2>
-    <p className="text-slate-500 max-w-md mb-8 font-medium text-center md:text-left text-sm md:text-base">
-      Carregue o relatório CSV exportado da telefonia para analisar a performance da equipe. Os dados serão salvos localmente.
-    </p>
-      <button 
-        onClick={onUpload}
-        title="Carregar Relatório CSV"
-        className="flex items-center justify-center bg-adarco-dark hover:bg-black text-white w-20 h-20 rounded-3xl transition-all shadow-xl active:scale-95"
-      >
-        <Upload size={32} />
-      </button>
-  </div>
-);
-
 const CustomTooltip = ({ active, payload, label }: any) => {
   if (active && payload && payload.length) {
     return (
@@ -137,28 +119,188 @@ const FilterSelect = ({ label, value, onChange, options, icon: Icon }: FilterSel
     </div>
   </div>
 );
+const cleanName = (name: string) => name.replace(/\s*-\s*(INS|ATEND).*/i, '').trim();
 
 // --- Main App ---
 
 export default function App() {
-  const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [data, setData] = useState<CallRecord[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState<string>('Todos');
   const [selectedConsultant, setSelectedConsultant] = useState<string>('Todos');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedType, setSelectedType] = useState<string>('Todos');
   const [startDate, setStartDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(1); // Primeiro dia do mês atual
-    return d.toISOString().split('T')[0];
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    return `${year}-${month}-01`;
   });
-  const [endDate, setEndDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [endDate, setEndDate] = useState<string>(() => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  });
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [pagError, setPagError] = useState<{
+    message: string;
+    detail: string;
+    page: number;
+    partialCount: number;
+  } | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
+  const normalizeApiData = useCallback((rawCalls: any[]): CallRecord[] => {
+    const seenUniqueIds = new Set<string>();
+    
+    return rawCalls
+      .map((call: any): CallRecord | null => {
+        // 1. Identificação Única
+        const uniqueId = String(call.id || call.uniqueid || call.externalId || '');
+        if (uniqueId && seenUniqueIds.has(uniqueId)) return null;
+        if (uniqueId) seenUniqueIds.add(uniqueId);
+
+        // 2. Extração de Ramal e Mapeamento de Time (Adarco Business Rule)
+        // O usuário orientou extrair de 'origin'
+        const rawOrigin = String(call.origin || '').trim();
+        const rawDestiny = String(call.destiny || '').trim();
+        
+        // Identifica se é entrada ou saída para pegar o ramal interno correto
+        const typeRaw = String(call.type || call.calltype || '').toUpperCase();
+        const isIncoming = typeRaw === 'ENTRANTE' || typeRaw === 'ENTRADA' || typeRaw === 'INCOMING';
+        
+        const internalExtension = isIncoming ? rawDestiny : rawOrigin;
+        const mapping = CONSULTANT_MAPPING[internalExtension];
+        
+        // Apenas Inside Sales (Time Débora/Marília)
+        if (!mapping) return null;
+
+        // 3. Normalização de Tipo/Direção
+        let type = 'Ignorar';
+        if (typeRaw === 'SAINTE' || typeRaw === 'SAÍDA' || typeRaw === 'OUTCOMING' || typeRaw === 'ATIVA') {
+          type = 'Ativa';
+        }
+
+        if (type === 'Ignorar') return null;
+
+        // 4. Duração e Status (KPI Efetividade: Atendida >= 20s)
+        const duration = parseInt(call.duration) || 0;
+        const rawDisposition = String(call.disposition || call.status || '').toUpperCase();
+        const isAnswered = rawDisposition === 'ANSWERED' || rawDisposition === 'ANSWER' || rawDisposition === 'ATENDIDA';
+        
+        const status = (isAnswered && duration >= 20) ? 'Atendida' : 'Não Atendida';
+
+        // 5. Data/Hora (Conversão ISO 8601)
+        let timestampISO = '';
+        try {
+          const rawTs = call.createdAt || call.startDate || call.start_date || call.date;
+          if (rawTs) {
+            const d = new Date(rawTs);
+            timestampISO = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+          } else {
+            timestampISO = new Date().toISOString();
+          }
+        } catch (e) {
+          timestampISO = new Date().toISOString();
+        }
+
+        // 6. Nome do Consultor e Limpeza
+        const rawDisplayName = call.originDisplayName || call.destinyDisplayName || mapping.name;
+        // O mapeamento CONSULTANT_MAPPING já contém o nome limpo no arquivo constants.ts
+        // Mas vamos garantir a limpeza se vier da API
+        const displayName = rawDisplayName ? cleanName(String(rawDisplayName)) : mapping.name;
+
+        return {
+          id: uniqueId,
+          extension: internalExtension,
+          displayName: displayName,
+          type,
+          status,
+          duration,
+          timestamp: timestampISO,
+          consultantName: mapping.name, // Nome oficial do mapeamento
+          team: mapping.team
+        };
+      })
+      .filter((item): item is CallRecord => item !== null);
+  }, []);
+
+  const processRawCalls = normalizeApiData; // Alias para manter compatibilidade com hooks antigos
+
+  const handleFileUpload = useCallback((file: File) => {
+    setIsLoading(true);
+    setErrorMsg(null);
+
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (results) => {
+        const parsedData = processRawCalls(results.data);
+        
+        if (parsedData.length > 0) {
+          setData(parsedData);
+          setLastUpdated(new Date());
+          localStorage.setItem('adarco_persisted_calls', JSON.stringify(parsedData));
+        } else {
+          setErrorMsg("Nenhuma chamada de Inside Sales identificada no CSV. Verifique os ramais mapeados.");
+        }
+        setIsLoading(false);
+      },
+      error: (err) => {
+        console.error("[App] CSV Parsing Error:", err);
+        setErrorMsg("Erro ao processar o arquivo CSV. Verifique o formato.");
+        setIsLoading(false);
+      }
+    });
+  }, [processRawCalls]);
+
+  const fetchDashboardData = useCallback(async () => {
+    setIsLoading(true);
+    setErrorMsg(null);
+    setPagError(null);
+    try {
+      const response = await axios.get('/api/calls', {
+        params: {
+          start: startDate ? `${startDate}T00:00:00Z` : undefined,
+          end: endDate ? `${endDate}T23:59:59Z` : undefined
+        }
+      });
+      
+      const parsedData = processRawCalls(response.data);
+      
+      if (parsedData.length > 0) {
+        setData(parsedData);
+        setLastUpdated(new Date());
+        localStorage.setItem('adarco_persisted_calls', JSON.stringify(parsedData));
+      } else {
+        if (data.length === 0) {
+          setErrorMsg("Nenhuma ligação encontrada na Bem Melhor para este período.");
+        } else {
+          setData([]);
+        }
+      }
+    } catch (error: any) {
+      console.error("[App] Erro API Bem Melhor:", error);
+      if (error.response?.data?.page) {
+        setPagError({
+          message: error.response.data.message,
+          detail: error.response.data.detail,
+          page: error.response.data.page,
+          partialCount: error.response.data.partialCount
+        });
+      } else {
+        const apiError = error.response?.data?.detail || error.response?.data?.error || "Erro ao conectar com a API Bem Melhor. Verifique sua chave.";
+        setErrorMsg(apiError);
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  }, [startDate, endDate, processRawCalls, data.length]);
+
   // Carrega dados persistidos do localStorage ao iniciar
-  React.useEffect(() => {
+  useEffect(() => {
     const savedData = localStorage.getItem('adarco_persisted_calls');
     if (savedData) {
       try {
@@ -166,15 +308,42 @@ export default function App() {
         if (Array.isArray(parsed) && parsed.length > 0) {
           setData(parsed);
           setLastUpdated(new Date());
-          console.log("[App] Dados recuperados do armazenamento local.");
         }
       } catch (e) {
         console.error("[App] Erro ao carregar cache local:", e);
       }
     }
-  }, []); 
+    
+    // Se não tiver dados em cache, tenta buscar automaticamente
+    if (!savedData || JSON.parse(savedData).length === 0) {
+       fetchDashboardData();
+    }
+  }, []); // Run once on mount
 
-  React.useEffect(() => {
+  // Busca dados sempre que o período mudar
+  useEffect(() => {
+    if (startDate && endDate) {
+      fetchDashboardData();
+    }
+  }, [startDate, endDate]);
+
+  // Regra de Atualização Automática: 10 min entre 08h e 20h
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      const now = new Date();
+      const hour = now.getHours();
+      
+      // Regra Adarco: Atualizar apenas entre 08h e 20h
+      if (hour >= 8 && hour < 20) {
+        console.log(`[AutoRefresh] Sincronizando dados às ${now.toLocaleTimeString()}`);
+        fetchDashboardData();
+      }
+    }, 10 * 60 * 1000); // 10 minutos
+
+    return () => clearInterval(intervalId);
+  }, [fetchDashboardData]);
+
+  useEffect(() => {
     const handleResize = () => {
       if (window.innerWidth < 768) {
         setIsSidebarOpen(false);
@@ -186,150 +355,6 @@ export default function App() {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
-
-  const triggerFileUpload = () => {
-    setErrorMsg(null);
-    fileInputRef.current?.click();
-  };
-
-  const processFile = (file: File | string) => {
-    setErrorMsg(null);
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      delimiter: ";", // Explicitly set semicolon as seen in the provided file
-      complete: (results) => {
-        if (!results.data || results.data.length === 0) {
-          setErrorMsg("O arquivo parece estar vazio ou em formato inválido.");
-          return;
-        }
-
-        const seenUniqueIds = new Set<string>();
-        const parsedData: CallRecord[] = results.data
-          .map((row: any) => {
-            const uniqueId = String(row['Uniqueid'] || row['Identificador'] || row['uniqueid'] || '');
-            if (uniqueId && seenUniqueIds.has(uniqueId)) return null;
-            if (uniqueId) seenUniqueIds.add(uniqueId);
-
-            const rawOrigin = String(row['Origem'] || row['src'] || '');
-            const rawDestiny = String(row['Destino'] || row['dst'] || '');
-
-            const getExtension = (val: string) => {
-              if (!val) return '';
-              const match = val.match(/\((\d+)\)/); 
-              if (match) return match[1];
-              const digitMatch = val.match(/(\d{4,5})/);
-              if (digitMatch) return digitMatch[1];
-              const cleaned = val.replace(/[^\d]/g, '').trim();
-              return cleaned.length >= 4 && cleaned.length <= 5 ? cleaned : '';
-            };
-
-            const getNameFromRaw = (val: string) => {
-              const insMatch = val.match(/^(.*?)\s*-\s*INS/i) || val.match(/^(.*?)\s+INS/i);
-              if (insMatch) return insMatch[1].trim();
-              return null;
-            };
-
-            const originExt = getExtension(rawOrigin);
-            const destinyExt = getExtension(rawDestiny);
-            
-            const mappingOrig = CONSULTANT_MAPPING[originExt];
-            const mappingDest = CONSULTANT_MAPPING[destinyExt];
-            
-            let consultantName = null;
-            let team = null;
-            let ext = '';
-            let foundIn: 'origin' | 'destiny' | null = null;
-
-            if (mappingOrig) {
-              consultantName = mappingOrig.name;
-              team = mappingOrig.team;
-              ext = originExt;
-              foundIn = 'origin';
-            } else if (mappingDest) {
-              consultantName = mappingDest.name;
-              team = mappingDest.team;
-              ext = destinyExt;
-              foundIn = 'destiny';
-            }
-
-            if (!consultantName) return null;
-
-            const typeRaw = String(row['Tipo'] || row['tipo'] || '').toLowerCase();
-            if (typeRaw.includes('interna') || typeRaw.includes('internal')) return null;
-
-            let type = '';
-            if (typeRaw.includes('sainte') || typeRaw.includes('outbound')) {
-              type = 'Ativa';
-            } else if (typeRaw.includes('entrante') || typeRaw.includes('inbound')) {
-              type = 'Receptiva';
-            } else if (foundIn) {
-              type = foundIn === 'origin' ? 'Ativa' : 'Receptiva';
-            } else {
-              return null;
-            }
-
-            const bilhetagemRaw = row['Bilhetagem'] || row['billablesec'] || '0';
-            const bilhetagem = parseInt(bilhetagemRaw) || 0;
-
-            const statusRaw = String(row['Status'] || row['status'] || '').toUpperCase();
-            // A ligação é considerada "Atendida" (Efetiva) apenas se durou no mínimo 20 segundos
-            const isAttended = (statusRaw.includes('ATEND') || statusRaw.includes('ANSWER') || bilhetagem > 0) && bilhetagem >= 20;
-            const status = isAttended ? 'Atendida' : 'Perdida';
-
-            const timestampStr = row['Data'] || row['timestamp'] || '';
-            let timestamp = new Date();
-            const formats = ['yyyy-MM-dd HH:mm:ss', 'dd/MM/yyyy HH:mm:ss', 'dd/MM/yyyy HH:mm', 'MM/dd/yyyy HH:mm:ss'];
-
-            for (const fmt of formats) {
-              try {
-                const p = parse(timestampStr, fmt, new Date(), { locale: ptBR });
-                if (!isNaN(p.getTime())) {
-                  timestamp = p;
-                  break;
-                }
-              } catch (e) {}
-            }
-
-            return {
-              extension: ext,
-              type,
-              status,
-              duration: bilhetagem,
-              timestamp: timestamp.toISOString(),
-              consultantName,
-              team: team as any
-            };
-          })
-          .filter((item): item is CallRecord => item !== null);
-
-        if (parsedData.length > 0) {
-          setData(parsedData);
-          setLastUpdated(new Date());
-          
-          // Salva no localStorage para persistência entre sessões
-          localStorage.setItem('adarco_persisted_calls', JSON.stringify(parsedData));
-
-          const dates = parsedData.map(d => new Date(d.timestamp).getTime());
-          const minDate = new Date(Math.min(...dates)).toISOString().split('T')[0];
-          const maxDate = new Date(Math.max(...dates)).toISOString().split('T')[0];
-          setStartDate(minDate);
-          setEndDate(maxDate);
-        } else {
-          setErrorMsg("Nenhum dado de Inside Sales foi encontrado no arquivo.");
-        }
-      },
-      error: (error) => {
-        setErrorMsg("Erro ao processar CSV: " + error.message);
-      }
-    });
-  };
-
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) processFile(file);
-    if (event.target) event.target.value = '';
-  };
 
   const availableConsultants = useMemo(() => {
     const baseList = Object.values(CONSULTANT_MAPPING);
@@ -349,26 +374,45 @@ export default function App() {
   }, [availableConsultants, selectedConsultant]);
 
   const dateFilteredData = useMemo(() => {
-    return data.filter(item => {
-      const itemDate = (item.timestamp || '').split('T')[0];
-      const matchesStartDate = !startDate || itemDate >= startDate;
-      const matchesEndDate = !endDate || itemDate <= endDate;
-      return matchesStartDate && matchesEndDate;
+    if (!startDate && !endDate) return data;
+    const filtered = data.filter(item => {
+      if (!item.timestamp) return false;
+      
+      const itemDate = item.timestamp.includes('T') 
+        ? item.timestamp.split('T')[0] 
+        : item.timestamp.split(' ')[0];
+      
+      const matchesStart = !startDate || itemDate >= startDate;
+      const matchesEnd = !endDate || itemDate <= endDate;
+      
+      return matchesStart && matchesEnd;
     });
+    
+    // Log diagnóstico para ajudar a entender o abandono de dados
+    if (data.length > 0 && filtered.length === 0) {
+      console.warn(`[Diagnostics] Filtro de data removeu todos os ${data.length} registros. Range: ${startDate} até ${endDate}`);
+    }
+    
+    return filtered;
   }, [data, startDate, endDate]);
 
   const filteredData = useMemo(() => {
-    return dateFilteredData.filter(item => {
+    const res = dateFilteredData.filter(item => {
       const matchesTeam = selectedTeam === 'Todos' || item.team === selectedTeam;
       const matchesConsultant = selectedConsultant === 'Todos' || item.consultantName === selectedConsultant;
-      const matchesType = selectedType === 'Todos' || item.type === selectedType;
       const matchesSearch = searchQuery === '' || 
         item.consultantName?.toLowerCase().includes(searchQuery.toLowerCase()) || 
         item.extension.includes(searchQuery);
       
-      return matchesTeam && matchesConsultant && matchesType && matchesSearch;
+      return matchesTeam && matchesConsultant && matchesSearch;
     });
-  }, [dateFilteredData, selectedTeam, selectedConsultant, selectedType, searchQuery]);
+
+    if (dateFilteredData.length > 0 && res.length === 0) {
+      console.warn(`[Diagnostics] Filtros de time/consultor removeram todos os ${dateFilteredData.length} registros pós-filtro de data.`);
+    }
+
+    return res;
+  }, [dateFilteredData, selectedTeam, selectedConsultant, searchQuery]);
 
   const dashboardStats = useMemo(() => {
     const activeCounts: Record<string, { name: string, count: number, team: string }> = {};
@@ -385,8 +429,10 @@ export default function App() {
     // Initialize counts for all consultants in selected team
     Object.values(CONSULTANT_MAPPING).forEach(c => {
       if (selectedTeam === 'Todos' || c.team === (selectedTeam as any)) {
-        activeCounts[c.name] = { name: c.name, count: 0, team: c.team };
-        successCounts[c.name] = { name: c.name, count: 0, team: c.team };
+        // Use clean name for display
+        const displayName = cleanName(c.name);
+        activeCounts[c.name] = { name: displayName, count: 0, team: c.team };
+        successCounts[c.name] = { name: displayName, count: 0, team: c.team };
       }
     });
 
@@ -394,33 +440,37 @@ export default function App() {
     let successCountTotal = 0;
 
     filteredData.forEach(call => {
-      const { consultantName, type, status, duration, team, extension } = call;
+      const { consultantName, type, status, duration, team, extension, displayName } = call;
       if (!consultantName) return;
+
+      // Use clean displayName if available, fallback to mapping name
+      const display = cleanName(displayName || consultantName);
 
       // Update global KPI counters
       if (type === 'Ativa') activeCountTotal++;
       if (status === 'Atendida') successCountTotal++;
 
-      // Update active/success counts if consultant is in the selected set
+      // Volume de Chamadas
       if (activeCounts[consultantName]) {
-        if (type === 'Ativa') {
-          activeCounts[consultantName].count++;
-        }
+        activeCounts[consultantName].count++;
+        // Maintain the most recent display name if it's more expressive
+        if (displayName) activeCounts[consultantName].name = cleanName(displayName);
       } else if (selectedTeam === 'Todos' || team === selectedTeam) {
-          // For dynamic INS not in static mapping
           if (!activeCounts[consultantName]) {
-            activeCounts[consultantName] = { name: consultantName, count: 0, team: team || "Inside Sales" };
+            activeCounts[consultantName] = { name: display, count: 0, team: team || "Inside Sales" };
           }
-          if (type === 'Ativa') activeCounts[consultantName].count++;
+          activeCounts[consultantName].count++;
       }
 
+      // Sucesso (Apenas chamadas atendidas >= 20s)
       if (successCounts[consultantName]) {
         if (status === 'Atendida') {
           successCounts[consultantName].count++;
+          if (displayName) successCounts[consultantName].name = cleanName(displayName);
         }
       } else if (selectedTeam === 'Todos' || team === selectedTeam) {
          if (!successCounts[consultantName]) {
-            successCounts[consultantName] = { name: consultantName, count: 0, team: team || "Inside Sales" };
+            successCounts[consultantName] = { name: display, count: 0, team: team || "Inside Sales" };
           }
           if (status === 'Atendida') successCounts[consultantName].count++;
       }
@@ -428,7 +478,7 @@ export default function App() {
       // Update Summary table data
       if (!summary[consultantName]) {
         summary[consultantName] = {
-          name: consultantName,
+          name: display,
           team: team || "Inside Sales",
           extension: extension,
           total: 0,
@@ -444,8 +494,8 @@ export default function App() {
       }
     });
 
-    const activeCallsByConsultant = Object.values(activeCounts).sort((a, b) => b.count - a.count);
-    const successCallsByConsultant = Object.values(successCounts).sort((a, b) => b.count - a.count);
+    const activeCallsByConsultant = Object.values(activeCounts).filter(a => a.count > 0).sort((a, b) => b.count - a.count);
+    const successCallsByConsultant = Object.values(successCounts).filter(a => a.count > 0).sort((a, b) => b.count - a.count);
     const consultantSummary = Object.values(summary).sort((a, b) => b.total - a.total);
 
     const total = filteredData.length;
@@ -471,6 +521,7 @@ export default function App() {
       [TeamName.DEBORA]: { name: TeamName.DEBORA, total: 0, success: 0 },
       [TeamName.MARILIA]: { name: TeamName.MARILIA, total: 0, success: 0 }
     };
+    // Use dateFilteredData to show whole team performance regardless of individual consultant filters
     dateFilteredData.forEach(d => {
       if (d.team && statsArr[d.team as keyof typeof statsArr]) {
         statsArr[d.team as keyof typeof statsArr].total++;
@@ -482,15 +533,69 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-offwhite flex text-graphite font-sans selection:bg-adarco-light selection:text-adarco-dark border-none">
-      <input 
-        type="file" 
-        ref={fileInputRef} 
-        accept=".csv" 
-        className="hidden" 
-        onChange={handleFileUpload} 
-      />
+      
+      {/* Modal de Erro de Paginação */}
+      <AnimatePresence>
+        {pagError && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setPagError(null)}
+              className="absolute inset-0 bg-black/60 backdrop-blur-md"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-lg bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-red-100"
+            >
+              <div className="bg-red-500 p-6 text-white flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                   <div className="bg-white/20 p-2 rounded-xl">
+                      <XCircle className="w-6 h-6 text-white" />
+                   </div>
+                   <h3 className="text-xl font-black tracking-tight uppercase">Falha na Extração</h3>
+                </div>
+                <button onClick={() => setPagError(null)} className="p-2 hover:bg-white/10 rounded-lg transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-8 space-y-6">
+                <div className="bg-red-50 border border-red-100 p-5 rounded-2xl">
+                  <p className="text-red-700 font-bold mb-2">Página de Falha: <span className="bg-red-600 text-white px-2 py-0.5 rounded text-sm">{pagError.page}</span></p>
+                  <p className="text-red-600 text-sm font-medium leading-relaxed">{pagError.message}</p>
+                </div>
 
-      {/* Mobile Sidebar Overlay */}
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between text-xs font-black uppercase tracking-widest text-slate-400">
+                    <span>Detalhe Técnico</span>
+                    <span className="text-[10px] bg-slate-100 px-2 py-0.5 rounded italic lowercase font-normal">{typeof pagError.detail === 'string' ? pagError.detail.substring(0, 30) : 'api_error'}...</span>
+                  </div>
+                  <div className="bg-slate-900 rounded-xl p-4 font-mono text-[11px] text-red-400 overflow-x-auto max-h-[150px] custom-scrollbar border border-slate-800">
+                     {pagError.detail}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4 py-4 border-t border-slate-100">
+                    <div className="flex-1">
+                        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Itens recuperados</p>
+                        <p className="text-2xl font-black text-adarco-dark">{pagError.partialCount}</p>
+                    </div>
+                    <button 
+                      onClick={fetchDashboardData}
+                      className="bg-adarco-dark text-white px-6 py-3 rounded-2xl font-bold text-sm hover:bg-black transition-all shadow-lg active:scale-95 flex items-center gap-2"
+                    >
+                      <RefreshCcw className="w-4 h-4" /> Tentar Novamente
+                    </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {isSidebarOpen && (
           <motion.div
@@ -536,14 +641,21 @@ export default function App() {
             </div>
             <div 
               onClick={() => {
+                const now = new Date();
+                const year = now.getFullYear();
+                const month = String(now.getMonth() + 1).padStart(2, '0');
+                const day = String(now.getDate()).padStart(2, '0');
+                
+                const firstDayStr = `${year}-${month}-01`;
+                const todayStr = `${year}-${month}-${day}`;
+                
                 setData([]);
                 setErrorMsg(null);
                 setSelectedTeam('Todos');
                 setSelectedConsultant('Todos');
-                setSelectedType('Todos');
                 setSearchQuery('');
-                setStartDate('');
-                setEndDate('');
+                setStartDate(firstDayStr);
+                setEndDate(todayStr);
               }}
               className="cursor-pointer group select-none"
             >
@@ -588,23 +700,48 @@ export default function App() {
                 icon={Users}
               />
 
-              <div className="space-y-3 pt-6 border-t border-white/20">
-                <p className="text-xs font-bold text-white/80 pl-1 flex items-center gap-2">
-                  <Calendar className="w-4 h-4 text-white" /> Período Temporal
-                </p>
-                <div className="grid grid-cols-1 gap-2">
-                  <input 
-                    type="date"
-                    className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-xs font-bold focus:ring-2 focus:ring-white/20 outline-none text-white color-scheme-dark shadow-inner"
-                    value={startDate}
-                    onChange={(e) => setStartDate(e.target.value)}
-                  />
-                  <input 
-                    type="date"
-                    className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-xs font-bold focus:ring-2 focus:ring-white/20 outline-none text-white color-scheme-dark shadow-inner"
-                    value={endDate}
-                    onChange={(e) => setEndDate(e.target.value)}
-                  />
+              <div className="space-y-4 pt-6 border-t border-white/10">
+                <div className="flex items-center justify-between px-1">
+                  <label className="text-[11px] font-black text-white/50 uppercase tracking-[0.2em] flex items-center gap-2">
+                    <Calendar className="w-3.5 h-3.5" /> Período
+                  </label>
+                  {(startDate || endDate) && (
+                    <button 
+                      onClick={() => { 
+                        const now = new Date();
+                        const year = now.getFullYear();
+                        const month = String(now.getMonth() + 1).padStart(2, '0');
+                        const day = String(now.getDate()).padStart(2, '0');
+                        
+                        setStartDate(`${year}-${month}-01`); 
+                        setEndDate(`${year}-${month}-${day}`); 
+                      }}
+                      className="text-[10px] font-black text-white/40 hover:text-white uppercase tracking-tighter transition-colors"
+                    >
+                      Resetar
+                    </button>
+                  )}
+                </div>
+                
+                <div className="space-y-3">
+                  <div className="space-y-1.5">
+                    <p className="text-[9px] font-bold text-white/30 uppercase pl-1">Data Inicial</p>
+                    <input 
+                      type="date"
+                      value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      className="w-full bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl px-4 py-2.5 text-xs font-bold text-white outline-none focus:ring-2 focus:ring-adarco-primary/30 transition-all [color-scheme:dark]"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-[9px] font-bold text-white/30 uppercase pl-1">Data Final</p>
+                    <input 
+                      type="date"
+                      value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      className="w-full bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl px-4 py-2.5 text-xs font-bold text-white outline-none focus:ring-2 focus:ring-adarco-primary/30 transition-all [color-scheme:dark]"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -630,10 +767,16 @@ export default function App() {
           <div>
             <h2 className="text-2xl md:text-3xl font-black tracking-tighter text-adarco-dark">Performance Inside Sales</h2>
             <div className="flex items-center gap-3 mt-2">
-              <span className="flex items-center gap-1 text-xs font-bold text-slate-400 uppercase tracking-tight">
-                <Calendar className="w-3.5 h-3.5" />
-                {data.length > 0 ? "Dados Ativos" : "Aguardando Importação"}
-              </span>
+              {isLoading && (
+                <motion.div 
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="flex items-center gap-2 px-2 py-0.5 bg-adarco-soft rounded-lg"
+                >
+                  <Loader2 className="w-3 h-3 text-adarco-primary animate-spin" />
+                  <span className="text-[10px] font-black text-adarco-dark uppercase">Processando...</span>
+                </motion.div>
+              )}
               {lastUpdated && (
                 <>
                   <div className="w-1.5 h-1.5 bg-slate-200 rounded-full" />
@@ -647,49 +790,78 @@ export default function App() {
                 Foco em Resultados
               </p>
             </div>
-            {errorMsg && (
-              <div className="mt-4 p-4 bg-red-50 border border-red-100 rounded-2xl flex items-center gap-3 animate-shake">
-                <XCircle className="w-5 h-5 text-red-500" />
-                <p className="text-sm font-bold text-red-600">{errorMsg}</p>
-              </div>
-            )}
+    {/* Erro Polite Popup */}
+    <AnimatePresence>
+      {errorMsg && (
+        <motion.div 
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -20 }}
+          className="mb-8 p-6 bg-white/90 backdrop-blur-xl border-2 border-adarco-soft rounded-[2rem] shadow-soft flex flex-col md:flex-row items-center justify-between gap-6"
+        >
+          <div className="flex items-center gap-5">
+            <div className="w-14 h-14 bg-adarco-soft rounded-2xl flex items-center justify-center shrink-0 shadow-inner">
+              <RefreshCcw className="w-7 h-7 text-adarco-primary animate-pulse" />
+            </div>
+            <div>
+              <p className="font-black text-adarco-dark text-lg tracking-tight">Olá! Tivemos um pequeno imprevisto ao carregar os dados.</p>
+              <p className="text-sm text-slate-500 font-bold opacity-80">Por favor, tente carregar novamente para atualizarmos seu dashboard.</p>
+              <p className="text-[10px] text-slate-300 font-mono mt-1 uppercase">Motivo: {errorMsg}</p>
+            </div>
+          </div>
+          <button 
+            onClick={fetchDashboardData}
+            className="bg-adarco-dark text-white px-8 py-4 rounded-[1.25rem] font-black text-xs uppercase tracking-widest hover:bg-black transition-all shadow-xl active:scale-95 flex items-center gap-3 whitespace-nowrap group"
+          >
+            <RefreshCcw className="w-4 h-4 group-hover:rotate-180 transition-transform duration-500" /> Sincronizar Agora
+          </button>
+        </motion.div>
+      )}
+    </AnimatePresence>
           </div>
 
-          <div className="flex flex-col sm:flex-row sm:items-center gap-4 w-full md:w-auto">
-             <div className="flex bg-white/60 backdrop-blur-md border border-white/50 shadow-soft rounded-2xl p-1.5 w-full sm:w-auto overflow-x-auto no-scrollbar">
-                {['Todos', 'Ativa', 'Receptiva'].map((type) => (
-                  <button
-                    key={type}
-                    onClick={() => setSelectedType(type)}
-                    className={cn(
-                      "flex-1 sm:flex-none px-4 md:px-5 py-2 text-[11px] font-black uppercase tracking-widest rounded-xl transition-all whitespace-nowrap",
-                      selectedType === type 
-                        ? "bg-adarco-dark text-white shadow-lg" 
-                        : "text-slate-400 hover:text-slate-600 hover:bg-slate-50"
-                    )}
-                  >
-                    {type}
-                  </button>
-                ))}
-              </div>
+          <div className="flex flex-col lg:flex-row lg:items-center gap-4 w-full md:w-auto">
               <div className="flex items-center gap-2 w-full sm:w-auto">
                 <button 
-                    onClick={triggerFileUpload}
-                    title="Carregar CSV"
-                    className="flex items-center justify-center p-3 bg-adarco-dark text-white rounded-2xl hover:bg-black transition-all shadow-soft w-[48px] h-[48px] shrink-0"
+                    onClick={fetchDashboardData}
+                    disabled={isLoading}
+                    title="Sincronizar com Bem Melhor"
+                    className="flex items-center justify-center p-3 bg-adarco-dark text-white rounded-2xl hover:bg-black transition-all shadow-soft w-[48px] h-[48px] shrink-0 disabled:opacity-50 group"
                 >
-                    <Upload className="w-5 h-5 font-bold" />
+                    {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <RefreshCcw className="w-5 h-5 font-bold group-hover:rotate-180 transition-transform duration-700" />}
                 </button>
+                
+                <div className="relative group overflow-hidden">
+                  <input
+                    type="file"
+                    accept=".csv"
+                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleFileUpload(file);
+                    }}
+                    disabled={isLoading}
+                  />
+                  <button 
+                      disabled={isLoading}
+                      title="Importar CSV Manual"
+                      className="flex items-center justify-center p-3 bg-white border border-slate-200 text-adarco-dark rounded-2xl hover:bg-slate-50 transition-all shadow-soft w-[48px] h-[48px] shrink-0 disabled:opacity-50 group"
+                  >
+                      <PhoneCall className="w-5 h-5" />
+                  </button>
+                </div>
+
                 <div className="relative group flex-1 sm:flex-none">
                     <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4 transition-colors group-focus-within:text-adarco-primary" />
                     <input 
                       type="text" 
-                      placeholder="Pesquisar consultor..."
-                      className="bg-white/80 backdrop-blur-md border border-white/50 rounded-2xl pl-11 pr-5 py-3 text-sm font-bold focus:ring-4 focus:ring-adarco-primary/20 focus:border-adarco-primary outline-none w-full sm:w-[200px] md:w-[320px] shadow-neon transition-all placeholder:text-slate-400"
+                      placeholder="Pesquisar..."
+                      className="bg-white/80 backdrop-blur-md border border-white/50 rounded-2xl pl-11 pr-5 py-3 text-sm font-bold focus:ring-4 focus:ring-adarco-primary/20 focus:border-adarco-primary outline-none w-full sm:w-[150px] md:w-[220px] shadow-neon transition-all placeholder:text-slate-400"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
                     />
                 </div>
+
                 <button 
                     onClick={() => setIsSidebarOpen(!isSidebarOpen)}
                     className="p-3 bg-white border border-slate-200 rounded-2xl text-slate-600 hover:bg-slate-50 transition-all shadow-soft md:hidden flex items-center justify-center min-w-[48px] h-[48px]"
@@ -701,19 +873,21 @@ export default function App() {
         </header>
 
         <AnimatePresence mode="wait">
-          {data.length === 0 ? (
-            <motion.div
-              key="empty"
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
+          {isLoading && data.length === 0 ? (
+            <motion.div 
+              key="loading-full"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="flex flex-col items-center justify-center min-h-[60vh]"
             >
-              <EmptyState onUpload={triggerFileUpload} />
-              {errorMsg && (
-                <p className="mt-4 text-center text-sm font-bold text-red-500 bg-red-50 py-2 rounded-lg max-w-sm mx-auto">
-                  {errorMsg}
-                </p>
-              )}
+              <div className="relative">
+                <div className="w-20 h-20 bg-adarco-soft rounded-full absolute inset-0 animate-ping opacity-20" />
+                <div className="w-20 h-20 bg-white border-2 border-adarco-soft rounded-full flex items-center justify-center shadow-lg relative z-10">
+                  <Loader2 className="w-10 h-10 text-adarco-primary animate-spin" />
+                </div>
+              </div>
+              <p className="mt-8 text-slate-400 font-black uppercase tracking-[0.3em] text-[10px]">Sincronizando Adarco BI...</p>
             </motion.div>
           ) : (
             <motion.div 
@@ -761,11 +935,13 @@ export default function App() {
                 <div className="bg-white/70 backdrop-blur-lg p-8 rounded-3xl shadow-soft border border-white/40">
                   <div className="flex items-center justify-between mb-8">
                     <div>
-                      <h3 className="font-bold text-slate-800 text-lg">Volume de Ligações Ativas</h3>
-                      <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mt-1">Por Consultor</p>
+                      <h3 className="font-bold text-slate-800 text-lg">
+                        Volume de Ligações Ativas
+                      </h3>
+                      <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mt-1">Esforço por Consultor</p>
                     </div>
                     <div className="p-3 bg-adarco-soft rounded-2xl">
-                      <PhoneOutgoing className="w-5 h-5 text-adarco-dark" />
+                      <PhoneCall className="w-5 h-5 text-adarco-dark" />
                     </div>
                   </div>
                   <div className="h-[300px] md:h-[400px]">
@@ -782,13 +958,13 @@ export default function App() {
                           type="category" 
                           axisLine={false} 
                           tickLine={false} 
-                          style={{ fontSize: '12px', fontWeight: 600, fill: '#475569' }}
+                          style={{ fontSize: '11px', fontWeight: 600, fill: '#475569' }}
                           width={100}
                         />
                         <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(20, 61, 45, 0.05)' }} />
                         <Bar 
                           dataKey="count" 
-                          name="Ligações Ativas"
+                          name="Volume de Chamadas"
                           radius={[0, 8, 8, 0]} 
                           barSize={32}
                         >
@@ -805,8 +981,8 @@ export default function App() {
                 <div className="bg-white/70 backdrop-blur-lg p-8 rounded-3xl shadow-soft border border-white/40">
                   <div className="flex items-center justify-between mb-8">
                     <div>
-                      <h3 className="font-bold text-slate-800 text-lg">Chamadas Atendidas (Sucesso)</h3>
-                      <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mt-1">Contatos Efetivos</p>
+                      <h3 className="font-bold text-slate-800 text-lg">Contatos Efetivos (≥ 20s)</h3>
+                      <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mt-1">Resultado por Consultor</p>
                     </div>
                     <div className="p-3 bg-adarco-light/20 rounded-2xl">
                       <CheckCircle2 className="w-5 h-5 text-adarco-primary" />
@@ -826,24 +1002,23 @@ export default function App() {
                           type="category" 
                           axisLine={false} 
                           tickLine={false} 
-                          style={{ fontSize: '12px', fontWeight: 600, fill: '#475569' }}
+                          style={{ fontSize: '11px', fontWeight: 600, fill: '#475569' }}
                           width={100}
                         />
                         <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(16, 185, 129, 0.05)' }} />
                         <Bar 
                           dataKey="count" 
-                          name="Contatos Efetivos"
+                          name="Chamadas Efetivas"
                           radius={[0, 8, 8, 0]} 
                           barSize={32}
                         >
                            {successCallsByConsultant.map((entry, index) => {
-                             // Lógica Visual: Verde para quem está acima da meta (ex: > 10 chamadas)
-                             // ou uma cor mais neutra para quem está abaixo
-                             const isHighPerformance = entry.count > 10; 
+                             // Lógica Visual: Verde para quem está acima da meta (ex: > 10 chamadas no período)
+                             const isHighPerformance = entry.count >= 10; 
                              return (
                                <Cell 
                                  key={`cell-${index}`} 
-                                 fill={isHighPerformance ? '#004D2C' : '#94A3B8'} 
+                                 fill={isHighPerformance ? '#166534' : '#94A3B8'} 
                                  fillOpacity={isHighPerformance ? 1 : 0.6}
                                />
                              );
