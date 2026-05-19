@@ -18,6 +18,7 @@ export const CONSULTANT_MAPPING: Record<string, Consultant> = {
   "6022": { extension: "6022", name: "Gabriela", team: TeamName.MARILIA },
   "6039": { extension: "6039", name: "Hillary", team: TeamName.MARILIA },
   "6030": { extension: "6030", name: "Kephini", team: TeamName.MARILIA },
+  "6040": { extension: "6040", name: "Anna", team: TeamName.MARILIA },
 };
 
 export const ALLOWED_EXTENSIONS = Object.keys(CONSULTANT_MAPPING);
